@@ -1,96 +1,106 @@
+"""core.py — Topic coherence and trend analysis metrics for TrendScope.
+
+These are NLP/topic-modeling metrics, NOT generic classification metrics:
+  * **Topic coherence (u_mass)** — log-conditional pairwise agreement
+    between top words in a topic (Mimno et al. 2011).
+  * **Topic diversity** — fraction of unique top words across all topics.
+  * **Trend slope** — linear regression slope of article counts over time.
+  * **Silhouette** — cluster separation on document-topic distributions.
+
+References
+----------
+Mimno et al. (2011), "Optimizing Semantic Coherence in Topic Models."
+Röder et al. (2015), "Exploring the Space of Topic Coherence Measures."
+"""
 from __future__ import annotations
 import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import train_test_split
-from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.metrics import (
-    roc_auc_score, accuracy_score, precision_score, recall_score, f1_score,
-    confusion_matrix, roc_curve, precision_recall_curve,
-)
-import xgboost as xgb
+from collections import Counter
 
 
-def compute_metrics(y_true, y_pred, y_proba=None):
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred).ravel()
-    metrics = {
-        "accuracy": accuracy_score(y_true, y_pred),
-        "precision": precision_score(y_true, y_pred, zero_division=0),
-        "recall": recall_score(y_true, y_pred, zero_division=0),
-        "f1": f1_score(y_true, y_pred, zero_division=0),
-        "specificity": tn / (tn + fp) if (tn + fp) > 0 else 0.0,
-        "fpr": fp / (fp + tn) if (fp + tn) > 0 else 0.0,
-        "fnr": fn / (fn + tp) if (fn + tp) > 0 else 0.0,
-    }
-    if y_proba is not None:
-        metrics["roc_auc"] = roc_auc_score(y_true, y_proba)
-        metrics["gini"] = 2.0 * metrics["roc_auc"] - 1.0
-    return metrics
+def topic_coherence_umass(top_words: list[str], docs_tokens: list[list[str]], top_n: int = 10) -> float:
+    """UMass coherence for a single topic.
+
+    C_umass = sum_{i<j} log( (D(w_i, w_j) + 1) / D(w_j) )
+    where D(w) = document frequency of word w, D(w_i, w_j) = co-document frequency.
+    """
+    words = top_words[:top_n]
+    if len(words) < 2:
+        return 0.0
+    doc_freq = Counter()
+    co_doc_freq = Counter()
+    for doc_tokens in docs_tokens:
+        doc_set = set(doc_tokens)
+        for w in words:
+            if w in doc_set:
+                doc_freq[w] += 1
+        for i in range(len(words)):
+            for j in range(i + 1, len(words)):
+                if words[i] in doc_set and words[j] in doc_set:
+                    co_doc_freq[(words[i], words[j])] += 1
+    coherence = 0.0
+    for j in range(1, len(words)):
+        for i in range(j):
+            denom = doc_freq.get(words[j], 0)
+            if denom == 0:
+                continue
+            numer = co_doc_freq.get((words[i], words[j]), 0) + 1
+            coherence += np.log(numer / denom)
+    return float(coherence)
 
 
-def ks_statistic(y_true, y_score):
-    ix = np.argsort(y_score)
-    y_true_sorted = y_true[ix]
-    y_score_sorted = y_score[ix]
-    n_total = len(y_true_sorted)
-    n_event = y_true_sorted.sum()
-    n_non_event = n_total - n_event
-    cum_event = np.cumsum(y_true_sorted) / n_event
-    cum_non_event = np.cumsum(1 - y_true_sorted) / n_non_event
-    return np.max(np.abs(cum_event - cum_non_event))
+def topic_diversity(all_top_words: list[list[str]], top_n: int = 10) -> float:
+    """Fraction of unique words across all topics' top-N lists."""
+    all_words = []
+    for words in all_top_words:
+        all_words.extend(words[:top_n])
+    if not all_words:
+        return 0.0
+    return len(set(all_words)) / len(all_words)
 
 
-def population_stability_index(expected, actual, n_bins=10):
-    eps = 1e-10
-    bins = np.linspace(0, 1, n_bins + 1)
-    bin_labels = np.digitize(np.clip(np.concatenate([expected, actual]), 0, 0.999), bins[1:-1]) - 1
-    expected_counts = np.bincount(bin_labels[:len(expected)], minlength=n_bins)
-    actual_counts = np.bincount(bin_labels[len(expected):], minlength=n_bins)
-    expected_pct = expected_counts / expected_counts.sum()
-    actual_pct = actual_counts / actual_counts.sum()
-    psi = np.sum((actual_pct - expected_pct) * np.log((actual_pct + eps) / (expected_pct + eps)))
-    return psi
+def trend_slope(counts: np.ndarray, window: int = None) -> float:
+    """Linear regression slope of a time series (trend direction).
+
+    Positive slope = increasing trend, negative = declining.
+    """
+    c = np.asarray(counts, dtype=float)
+    if c.size < 2:
+        return 0.0
+    x = np.arange(c.size, dtype=float)
+    x_mean, c_mean = x.mean(), c.mean()
+    denom = np.sum((x - x_mean) ** 2)
+    if denom == 0:
+        return 0.0
+    return float(np.sum((x - x_mean) * (c - c_mean)) / denom)
 
 
-def build_models(X_train, y_train, seed=42):
-    lr = LogisticRegression(C=0.1, class_weight="balanced", solver="liblinear", random_state=seed, max_iter=1000)
-    lr.fit(X_train, y_train)
-    rf = RandomForestClassifier(n_estimators=200, max_depth=8, min_samples_leaf=20,
-                                class_weight="balanced", random_state=seed, n_jobs=-1)
-    rf.fit(X_train, y_train)
-    gbt = GradientBoostingClassifier(n_estimators=200, max_depth=5, min_samples_leaf=20,
-                                     learning_rate=0.05, subsample=0.8, random_state=seed)
-    gbt.fit(X_train, y_train)
-    xgb_model = xgb.XGBClassifier(
-        n_estimators=200, max_depth=5, learning_rate=0.05,
-        subsample=0.8, colsample_bytree=0.8,
-        scale_pos_weight=(y_train.mean() > 0.1) * 1.0 + (y_train.mean() <= 0.1) * 3.0,
-        eval_metric="logloss", random_state=seed,
-    )
-    xgb_model.fit(X_train, y_train)
-    return {
-        "Logistic Regression": lr,
-        "Random Forest": rf,
-        "Gradient Boosting": gbt,
-        "XGBoost": xgb_model,
-    }
+def silhouette_score_simple(doc_topic_dist: np.ndarray, labels: np.ndarray) -> float:
+    """Simplified silhouette score for document-topic clustering.
 
-
-def woe_transform(df, feature, target, min_samples=5):
-    if df[feature].dtype == object or df[feature].nunique() < 10:
-        groups = df.groupby(feature)[target]
-    else:
-        df["_bin"] = pd.qcut(df[feature], 10, duplicates="drop")
-        groups = df.groupby("_bin")[target]
-    result = groups.agg(["count", "sum"])
-    result.columns = ["count", "event"]
-    result = result[result["count"] >= min_samples]
-    result["non_event"] = result["count"] - result["event"]
-    n_event_total = result["event"].sum()
-    n_non_event_total = result["non_event"].sum()
-    result["event_rate"] = (result["event"] + 0.5) / (n_event_total + 0.5)
-    result["non_event_rate"] = (result["non_event"] + 0.5) / (n_non_event_total + 0.5)
-    result["woe"] = np.log(result["event_rate"] / result["non_event_rate"])
-    result["iv"] = (result["event_rate"] - result["non_event_rate"]) * result["woe"]
-    return result
+    Measures how similar a document is to its assigned topic cluster
+    vs other clusters. Range [-1, 1], higher = better separated.
+    """
+    D = np.asarray(doc_topic_dist, dtype=float)
+    labels = np.asarray(labels)
+    n = len(labels)
+    if n < 2 or len(set(labels)) < 2:
+        return 0.0
+    scores = []
+    for i in range(n):
+        same = labels == labels[i]
+        same[i] = False
+        if same.sum() == 0:
+            a_i = 0.0
+        else:
+            a_i = np.mean(np.linalg.norm(D[i] - D[same], axis=1))
+        b_i = float('inf')
+        for other_label in set(labels) - {labels[i]}:
+            other = labels == other_label
+            if other.sum() > 0:
+                b_i = min(b_i, np.mean(np.linalg.norm(D[i] - D[other], axis=1)))
+        if b_i == float('inf'):
+            scores.append(0.0)
+        else:
+            s = (b_i - a_i) / max(a_i, b_i) if max(a_i, b_i) > 0 else 0.0
+            scores.append(s)
+    return float(np.mean(scores))

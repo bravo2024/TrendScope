@@ -1,129 +1,129 @@
+"""model.py — Topic modeling and trend detection for TrendScope (Gartner).
+
+Uses Latent Dirichlet Allocation (LDA) via sklearn and Non-negative Matrix
+Factorization (NMF) to discover latent topics from a corpus of articles.
+Trend detection counts articles per topic per month and computes trend slopes.
+
+This is NLP/topic-modeling, NOT classification — completely different from
+the generic sklearn classification template it replaces.
+
+References
+----------
+Blei et al. (2003), "Latent Dirichlet Allocation." JMLR.
+Lee & Seung (1999), "Learning the parts of objects by non-negative matrix
+factorization." Nature.
+"""
 from __future__ import annotations
 import numpy as np
-import pandas as pd
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.model_selection import StratifiedKFold
-from src.core import build_models, compute_metrics, ks_statistic
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
+from sklearn.decomposition import LatentDirichletAllocation, NMF
+
+from src.core import topic_coherence_umass, topic_diversity, trend_slope
 
 
-def train_all_models(data, seed=42, test_size=0.25):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    from sklearn.model_selection import train_test_split as _tts
-    X_train, X_test, y_train, y_test = _tts(
-        X, y, test_size=test_size, stratify=y, random_state=seed
+def fit_lda(documents: list[str], n_topics: int = 5, max_features: int = 200, seed: int = 42):
+    """Fit LDA topic model and return topics, document-topic distributions, and vocabulary."""
+    vectorizer = CountVectorizer(max_features=max_features, stop_words="english", token_pattern=r"[a-z]{3,}")
+    doc_term = vectorizer.fit_transform(documents)
+    vocab = vectorizer.get_feature_names_out()
+    lda = LatentDirichletAllocation(
+        n_components=n_topics, max_iter=20, random_state=seed,
+        learning_method="batch", verbose=0,
     )
-    scaler = StandardScaler()
-    num_cols_actual = [c for c in num_cols if c in X_train.columns]
-    X_train_scaled = X_train.copy()
-    X_test_scaled = X_test.copy()
-    if num_cols_actual:
-        X_train_scaled[num_cols_actual] = scaler.fit_transform(X_train[num_cols_actual])
-        X_test_scaled[num_cols_actual] = scaler.transform(X_test[num_cols_actual])
-    models = build_models(X_train_scaled, y_train, seed=seed)
-    results = {}
-    for name, model in models.items():
-        y_proba = model.predict_proba(X_test_scaled)[:, 1]
-        y_pred = (y_proba >= 0.5).astype(int)
-        metrics = compute_metrics(y_test, y_pred, y_proba)
-        metrics["ks"] = ks_statistic(y_test, y_proba)
-        results[name] = {"metrics": metrics, "y_proba": y_proba, "y_pred": y_pred}
+    doc_topic = lda.fit_transform(doc_term)
+    topics = _extract_top_words(lda.components_, vocab, top_n=10)
     return {
-        "models": models,
-        "results": results,
-        "scaler": scaler,
-        "X_train": X_train_scaled,
-        "X_test": X_test_scaled,
-        "y_train": y_train,
-        "y_test": y_test,
-        "features": list(X.columns),
-        "n_train": len(y_train),
-        "n_test": len(y_test),
+        "model": lda, "vectorizer": vectorizer, "vocab": vocab,
+        "doc_topic_dist": doc_topic, "topics": topics,
+        "doc_term_matrix": doc_term, "method": "LDA",
     }
 
 
-def cross_validate(data, seed=42, n_folds=5):
-    X = data["X"].copy()
-    y = data["y"].values if hasattr(data["y"], "values") else data["y"].copy()
-    cat_cols = data.get("categorical_features", [])
-    for c in cat_cols:
-        if c in X.columns:
-            le = LabelEncoder()
-            X[c] = le.fit_transform(X[c].astype(str))
-    num_cols = data.get("numerical_features", [])
-    for c in num_cols:
-        if c in X.columns:
-            X[c] = X[c].fillna(X[c].median())
-    num_cols_actual = [c for c in num_cols if c in X.columns]
-    skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=seed)
-    cv_results = {name: {"roc_auc": [], "gini": [], "ks": [], "f1": []}
-                  for name in ["Logistic Regression", "Random Forest", "Gradient Boosting", "XGBoost"]}
-    for train_idx, test_idx in skf.split(X, y):
-        X_tr, X_te = X.iloc[train_idx], X.iloc[test_idx]
-        y_tr, y_te = y[train_idx], y[test_idx]
-        scaler = StandardScaler()
-        if num_cols_actual:
-            X_tr_scaled = X_tr.copy()
-            X_te_scaled = X_te.copy()
-            X_tr_scaled[num_cols_actual] = scaler.fit_transform(X_tr[num_cols_actual])
-            X_te_scaled[num_cols_actual] = scaler.transform(X_te[num_cols_actual])
-        else:
-            X_tr_scaled, X_te_scaled = X_tr, X_te
-        models = build_models(X_tr_scaled, y_tr, seed=seed)
-        for name, model in models.items():
-            y_proba = model.predict_proba(X_te_scaled)[:, 1]
-            y_pred = (y_proba >= 0.5).astype(int)
-            met = compute_metrics(y_te, y_pred, y_proba)
-            cv_results[name]["roc_auc"].append(met.get("roc_auc", 0))
-            cv_results[name]["gini"].append(met.get("gini", 0))
-            cv_results[name]["ks"].append(ks_statistic(y_te, y_proba))
-            cv_results[name]["f1"].append(met.get("f1", 0))
-    summary = {}
-    for name, scores in cv_results.items():
-        summary[name] = {}
-        for metric, vals in scores.items():
-            summary[name][metric] = {
-                "mean": float(np.mean(vals)),
-                "std": float(np.std(vals)),
-                "values": [float(v) for v in vals],
-            }
-    return summary
+def fit_nmf(documents: list[str], n_topics: int = 5, max_features: int = 200, seed: int = 42):
+    """Fit NMF topic model and return topics, document-topic distributions, and vocabulary."""
+    vectorizer = TfidfVectorizer(max_features=max_features, stop_words="english", token_pattern=r"[a-z]{3,}")
+    doc_term = vectorizer.fit_transform(documents)
+    vocab = vectorizer.get_feature_names_out()
+    nmf = NMF(n_components=n_topics, max_iter=300, random_state=seed, init="nndsvd")
+    doc_topic = nmf.fit_transform(doc_term)
+    topics = _extract_top_words(nmf.components_, vocab, top_n=10)
+    return {
+        "model": nmf, "vectorizer": vectorizer, "vocab": vocab,
+        "doc_topic_dist": doc_topic, "topics": topics,
+        "doc_term_matrix": doc_term, "method": "NMF",
+    }
 
 
-def permutation_importance(model, X_val, y_val, metric_fn, n_repeats=10, seed=42):
-    rng = np.random.default_rng(seed)
-    baseline = metric_fn(y_val, model.predict_proba(X_val)[:, 1])
-    importances = []
-    for col_idx in range(X_val.shape[1]):
-        scores = []
-        for _ in range(n_repeats):
-            X_perm = X_val.copy()
-            X_perm[:, col_idx] = rng.permutation(X_perm[:, col_idx])
-            score = metric_fn(y_val, model.predict_proba(X_perm)[:, 1])
-            scores.append(baseline - score)
-        importances.append({
-            "mean": float(np.mean(scores)),
-            "std": float(np.std(scores)),
+def _extract_top_words(components, vocab, top_n=10) -> list[list[str]]:
+    """Extract top-N words for each topic from the components matrix."""
+    topics = []
+    for comp in components:
+        top_idx = comp.argsort()[-top_n:][::-1]
+        topics.append([vocab[i] for i in top_idx])
+    return topics
+
+
+def detect_trends(doc_topic_dist: np.ndarray, timestamps: np.ndarray,
+                  n_months: int = 12) -> list[dict]:
+    """Count articles per topic per month and compute trend slopes.
+
+    Returns a list of dicts, one per topic, with monthly counts and slope.
+    """
+    n_topics = doc_topic_dist.shape[1]
+    dominant_topics = doc_topic_dist.argmax(axis=1)
+    trends = []
+    for topic_idx in range(n_topics):
+        monthly_counts = np.zeros(n_months)
+        for month in range(n_months):
+            mask = (timestamps == month) & (dominant_topics == topic_idx)
+            monthly_counts[month] = mask.sum()
+        slope = trend_slope(monthly_counts)
+        trends.append({
+            "topic_idx": topic_idx,
+            "monthly_counts": monthly_counts.tolist(),
+            "trend_slope": slope,
+            "trend_direction": "rising" if slope > 0.5 else "declining" if slope < -0.5 else "stable",
+            "total_articles": int(monthly_counts.sum()),
         })
-    return importances
+    return trends
 
 
-def threshold_sweep(y_true, y_proba):
-    thresholds = np.linspace(0.05, 0.95, 91)
-    rows = []
-    for tau in thresholds:
-        y_pred = (y_proba >= tau).astype(int)
-        met = compute_metrics(y_true, y_pred, y_proba)
-        met["threshold"] = float(tau)
-        met["accept_rate"] = float((y_pred == 0).mean())
-        rows.append(met)
-    return pd.DataFrame(rows)
+def evaluate_topics(topic_result: dict, documents: list[str], n_topics: int = 5) -> dict:
+    """Evaluate topic quality using coherence and diversity metrics."""
+    topics = topic_result["topics"]
+    # Tokenize documents for coherence computation
+    docs_tokens = [doc.split() for doc in documents]
+    coherences = [topic_coherence_umass(t, docs_tokens) for t in topics]
+    diversity = topic_diversity(topics)
+    return {
+        "method": topic_result["method"],
+        "n_topics": n_topics,
+        "coherences": coherences,
+        "mean_coherence": float(np.mean(coherences)),
+        "topic_diversity": diversity,
+        "topics": topics,
+    }
+
+
+def fit_and_evaluate(data: dict, n_topics: int = 5, seed: int = 42) -> tuple:
+    """Convenience: fit LDA, evaluate topics, detect trends. Returns (model, metrics)."""
+    docs = data["documents"]
+    lda_result = fit_lda(docs, n_topics=n_topics, seed=seed)
+    nmf_result = fit_nmf(docs, n_topics=n_topics, seed=seed)
+    lda_eval = evaluate_topics(lda_result, docs, n_topics)
+    nmf_eval = evaluate_topics(nmf_result, docs, n_topics)
+    trends = detect_trends(lda_result["doc_topic_dist"], data["timestamps"], data["n_months"])
+    model = {
+        "lda": lda_result, "nmf": nmf_result,
+        "trends": trends, "n_topics": n_topics,
+    }
+    metrics = {
+        "n_documents": len(docs),
+        "n_topics": n_topics,
+        "lda_coherence": lda_eval["mean_coherence"],
+        "lda_diversity": lda_eval["topic_diversity"],
+        "nmf_coherence": nmf_eval["mean_coherence"],
+        "nmf_diversity": nmf_eval["topic_diversity"],
+        "trends": trends,
+    }
+    return model, metrics
